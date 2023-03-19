@@ -1,14 +1,14 @@
 ---
 layout: post
-title: "Blog模板"
+title: "test"
 date: 2023-03-19
-description: "Blog模板"
+description: "test模板"
 tag: 工具
 ---
 
 ### 前言
 
-　　`前言`内容。
+　　`前言`内容，作为后续模板使用。
 
 ### 目录
 
