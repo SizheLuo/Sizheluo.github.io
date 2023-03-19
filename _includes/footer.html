@@ -74,6 +74,7 @@
           </li>
           {% endif %}
 
+          {% if site.social.mail %}
           <!-- RSS -->
           <li class="navigation__item_social">
             <a href="/feed.xml" rel="author" title="RSS" target="_blank">
@@ -81,6 +82,7 @@
               <span class="label">RSS</span>
             </a>
           </li>
+          {% endif %}
 
         </ul>
       </nav>
@@ -91,7 +93,7 @@
       <p class="copyright text-muted">
         Copyright &copy; {{ site.title }} {{ site.time | date: '%Y' }} |
         <iframe style="margin-left: 2px; margin-bottom:-5px;" frameborder="0" scrolling="0" width="91px" height="20px"
-          src="https://ghbtns.com/github-btn.html?user=shimingyah&repo=shimingyah.github.io&type=star&count=true">
+          src="https://ghbtns.com/github-btn.html?user=sizheluo&repo=sizheluo.github.io&type=star&count=true">
         </iframe>
       </p>
       <div align="right">
