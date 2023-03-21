@@ -1,9 +1,9 @@
 ---
 layout: post
-title: "BadgerDB源码分析之Wisckey论文"
-date: 2019-08-05
-description: "BadgerDB源码分析之Wisckey论文"
-tag: BadgerDB
+title: "RocksDB源码分析之Wisckey论文"
+date: 2023-03-22
+description: "RocksDB源码分析之Wisckey论文"
+tag: 分布式存储
 ---
 
 ### 前言
@@ -78,7 +78,8 @@ Wisckey key-value分离在大value下效果显著，但是对于小value却不�
 
 ### 参考资源
 
-* [WiscKey: Separating Keys from Values
-in SSD-conscious Storage](https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf)
+* [WiscKey: Separating Keys from Values in SSD-conscious Storage](https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf)
 
-转载请注明：[史明亚的博客](https://shimingyah.github.io) » [BadgerDB源码分析之Wisckey论文](https://shimingyah.github.io/2019/08/BadgerDB%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90%E4%B9%8Bwisckey%E8%AE%BA%E6%96%87/)
+* [转载自史明亚的博客](https://shimingyah.github.io/2019/08/BadgerDB%E6%BA%90%E7%A0%81%E5%88%86%E6%9E%90%E4%B9%8Bwisckey%E8%AE%BA%E6%96%87/)
+
+转载请注明：[sizheluo的博客](https://sizheluo.github.io) » [文章标题](文章链接) » [RocksDB源码分析之Wisckey论文](https://sizheluo.github.io/2023/03/RocksDB源码分析之Wisckey论文/)
