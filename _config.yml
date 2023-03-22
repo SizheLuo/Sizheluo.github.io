@@ -1,16 +1,16 @@
 # Basic
-title: sizheluo
+title: 参禅不说话
 subtitle: 个人博客
-description: 练习时长两年半的练习生。
+description: sizhe的杂记随笔。
 # 头像里面的标题
-avatarTitle: zhege
+avatarTitle: sizhe
 # 头像里面的描述
 avatarDesc: 分布式存储
 url: "https://sizheluo.github.io/"
 
 # Comment
 comment:
-    disqus: 一介小兵
+    disqus: sizhe
     # gitment: xxx // 需要修改 comments.html中的client_id和client_secret
     # uyan: 2143225  # 有言id,登录有言官网申请
 
