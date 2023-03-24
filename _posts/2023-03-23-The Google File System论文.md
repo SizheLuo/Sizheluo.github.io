@@ -19,30 +19,41 @@ tag: 分布式系统
 * [GC机制](#chapter5)
 * [改进点](#chapter6)
 
-### <a name="chapter1"></a>LSM读写放大
+### <a name="chapter1"></a> 一、GFS的设计决策
 
-`LSM写放大`主要是因为Compaction，每次在两层之间做Compaction时，都需要将多个sstable读出来做排序(读放大)，再写到磁盘。
+##### <font color="#0000dd">三个原则</font><br /> #####
+##### 1. 以工程上“简单”为设计原则  #####
+GFS直接使用了Linux服务上的`(1)普通文件系统作为基础存储层`，并且选择了最简单的`(2)单Master`设计。单Master让GFS的架构变得非常简单，避免了需要管理复杂的一致性问题。不过它也带来了很多限制，比如一旦Master出现故障，整个集群就无法写入数据，所以GFS其实算不上一个`高可用`的系统。
 
-`LSM读放大`LSM查找一个key时，经过的流程是memtable--->imutable--->level's sstable。此时假设该key不存在，memtable和imutable是内存操作很快，但是在sstabe这一层，就需要把每一层做二分查找搜一遍。特别是第0层是全局无序的，有overlap存在，需要查找每一个文件，虽然有bloom filter但是依旧影响查找的效率。
+但另外一方面，GFS还是采用了`Checkpoints`、`操作日志（Operation Logs）`、`影子 Master（Shadow Master）`等一系列的工程手段，来尽可能地保障整个系统的`可恢复（Recoverable）`，以及读层面的`可用性（Availability）`。
 
-value比较大的时候Compaction的问题尤其明显，期间sstable的读写都是将key-value一起进行的，value过大时效率便会很低。这些放大的影响在HDD上抵消磁盘的Seek消耗还是值得的。但是SSD就不一样了，SSD随机读写要快的多，并且可以使用其并行随机读取的特性。LSM适用于小value的场景，在对象场景中不适用，因此就需要把key-value分离存储来适应更多的场景。
-![](http://img-ys011.didistatic.com/static/anything/rw-amplification.png)
+##### 2. 根据硬件特性来进行设计取舍  #####
+2003年，大家都还在用机械硬盘，随机读写的性能很差，所以在GFS的设计中，重视的是顺序读写的性能，对随机写入的一致性甚至没有任何保障。
 
-### <a name="chapter2"></a>Wisckey设计目标
+##### 3. 根据实际应用的特性，放宽了数据一致性（consistency）的选择  #####
+论文里也提到，GFS是为了在廉价硬件上进行大规模数据处理而设计的。所以GFS的一致性相当宽松。GFS本身对于`随机写入的一致性没有任何保障`，而是把这个任务交给了客户端。对于`追加写入（Append）`，GFS 也只是作出了`至少一次（At LeastOnce）`这样宽松的保障。
 
-**Wisckey的基本原理：将key-value分离存储**。LSM-Tree里面存储的是一个key以及value的偏移位置，value本身以WAL方式append写入到log文件中。这样在做Compaction的时候就只需要重写key以及value的偏移位置就可以了，在key-szie远远小于value-size的场景中降低写放大的效果显著。
 
-然而当value很小的时候，重写value的开销就很小，key-value分离带来的好处便不足以抵消其本身的开销(**读写key-value需要操作不同的文件，在range query的场景下，会产生多次的随机IO**)
+### <a name="chapter2"></a>二、以“简单”为原则
 
-`写流程`先把value append写入vlog(为了GC操作也会写入key)，然后把key-value偏移位置写入LSM-Tree。
+![](https://s3.uuu.ovh/imgs/2023/03/25/bd84e804221f7bb4.png)
 
-`读流程`先从LSM-Tree里面读取key-value偏移位置，然后从vlog读取value。
+在这个设计原则下，可以看到GFS是一个非常简单的`单Master`架构，但是这个Master其实有三种不同的身份，分别是：
 
-`删流程`只需把key从LSM-Tree里面删除，无需操作vlog。
+- 相对于存储数据的`Chunkserver`，Master是一个目录服务；
+- 相对于为了灾难恢复的`Backup Master`，它是一个`同步复制的主从架构`下的主节点；
+- 相对于为了保障读数据的可用性而设立的`Shadow Master`，它是一个`异步复制的主从架构`下的主节点。
 
-由于做Compaction时不需要重写value，大大减小了写放大。同时LSM-Tree更小，一个Block能存储更多的key，也会相应的减小读放大，能缓存到的key-value偏移位置也更多，缓存效果会更好。总体来看，Wisckey很像是一个用LSM-Tree做索引用的BitCask。
+并且，这三种身份是依靠不同的独立模块完成的，互相之间并不干扰。本节的内容主要介绍常见的`主从架构（Master-Slave）`下的Master的职责，以及数据复制的模式。
 
-![](http://img-ys011.didistatic.com/static/anything/k-v-split.png)
+##### 1. Master 的第一个身份：一个目录服务  #####
+
+
+
+
+
+
+
 
 ### <a name="chapter3"></a>并行Range查询
 
