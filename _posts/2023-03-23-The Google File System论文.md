@@ -18,8 +18,10 @@ tag: 分布式系统
 * [GFS 写流程](#chapter4)
 * [GFS Consistency Model（一致性模型）](#chapter5)
 * [总结](#chapter6)
-* 
+
 ### <a name="chapter1"></a> 1. GFS 的设计决策
+
+![](https://s3.uuu.ovh/imgs/2023/04/08/26bdf65138002af6.png)
 
 ##### <font color="#0000dd">三个原则</font><br /> #####
 ##### 1. 以工程上“简单”为设计原则  #####
