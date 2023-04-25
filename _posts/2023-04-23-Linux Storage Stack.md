@@ -117,20 +117,96 @@ IO是操作系统内核最重要的组成部分之一，它的概念很广，本
 
 ![](https://wjqwsp.github.io/img/vfs-model.png)
 
-#####superblock对象#####
+#### superblock对象
 
 　　superblock对象定义了整个文件系统的元信息，它实际上是一个结构体。
 
-[https://github.com/torvalds/linux/blob/v4.16/fs/xfs/xfs_super.c#L1789](https://github.com/torvalds/linux/blob/v4.16/fs/xfs/xfs_super.c#L1789)
-
 ```
-static const struct super_operations xfs_super_operations = {
-	......
-};
-
-static struct file_system_type xfs_fs_type = {
-	.name			= "xfs",
-	......
+struct super_block {
+	struct list_head	s_list;		/* Keep this first */
+	dev_t			s_dev;		/* search index; _not_ kdev_t */
+	unsigned char		s_blocksize_bits;
+	unsigned long		s_blocksize;
+	loff_t			s_maxbytes;	/* Max file size */
+	struct file_system_type	*s_type;
+	const struct super_operations	*s_op;
+	const struct dquot_operations	*dq_op;
+	const struct quotactl_ops	*s_qcop;
+	const struct export_operations *s_export_op;
+	unsigned long		s_flags;
+	unsigned long		s_magic;
+	struct dentry		*s_root;
+	struct rw_semaphore	s_umount;
+	int			s_count;
+	atomic_t		s_active;
+#ifdef CONFIG_SECURITY
+	void                    *s_security;
+#endif
+	const struct xattr_handler **s_xattr;
+	struct list_head	s_inodes;	/* all inodes */
+	struct hlist_bl_head	s_anon;		/* anonymous dentries for (nfs) exporting */
+#ifdef __GENKSYMS__
+#ifdef CONFIG_SMP
+	struct list_head __percpu *s_files;
+#else
+	struct list_head	s_files;
+#endif
+#else
+#ifdef CONFIG_SMP
+	struct list_head __percpu *s_files_deprecated;
+#else
+	struct list_head	s_files_deprecated;
+#endif
+#endif
+	struct list_head	s_mounts;	/* list of mounts; _not_ for fs use */
+	/* s_dentry_lru, s_nr_dentry_unused protected by dcache.c lru locks */
+	struct list_head	s_dentry_lru;	/* unused dentry lru */
+	int			s_nr_dentry_unused;	/* # of dentry on lru */
+	/* s_inode_lru_lock protects s_inode_lru and s_nr_inodes_unused */
+	spinlock_t		s_inode_lru_lock ____cacheline_aligned_in_smp;
+	struct list_head	s_inode_lru;		/* unused inode lru */
+	int			s_nr_inodes_unused;	/* # of inodes on lru */
+	struct block_device	*s_bdev;
+	struct backing_dev_info *s_bdi;
+	struct mtd_info		*s_mtd;
+	struct hlist_node	s_instances;
+	struct quota_info	s_dquot;	/* Diskquota specific options */
+	struct sb_writers	s_writers;
+	char s_id[32];				/* Informational name */
+	u8 s_uuid[16];				/* UUID */
+	void 			*s_fs_info;	/* Filesystem private info */
+	unsigned int		s_max_links;
+	fmode_t			s_mode;
+	/* Granularity of c/m/atime in ns.
+	   Cannot be worse than a second */
+	u32		   s_time_gran;
+	/*
+	 * The next field is for VFS *only*. No filesystems have any business
+	 * even looking at it. You had been warned.
+	 */
+	struct mutex s_vfs_rename_mutex;	/* Kludge */
+	/*
+	 * Filesystem subtype.  If non-empty the filesystem type field
+	 * in /proc/mounts will be "type.subtype"
+	 */
+	char *s_subtype;
+	/*
+	 * Saved mount options for lazy filesystems using
+	 * generic_show_options()
+	 */
+	char __rcu *s_options;
+	const struct dentry_operations *s_d_op; /* default d_op for dentries */
+	/*
+	 * Saved pool identifier for cleancache (-1 means none)
+	 */
+	int cleancache_poolid;
+	struct shrinker s_shrink;	/* per-sb shrinker handle */
+	/* Number of inodes with nlink == 0 but still referenced */
+	atomic_long_t s_remove_count;
+	/* Being remounted read-only */
+	int s_readonly_remount;
+	/* AIO completions deferred from interrupt context */
+	RH_KABI_EXTEND(struct workqueue_struct *s_dio_done_wq)
 };
 ```
 
@@ -143,7 +219,7 @@ static struct file_system_type xfs_fs_type = {
 5. `s_inodes`字段引用了该超级块的所有inode构成的链表的首元素和尾元素。
 6. `s_op`字段封装了一些函数指针，这些函数指针就指向真实文件系统实现的函数，superblock对象定义的函数主要是读、写、分配inode的操作。多态主要是通过函数指针指向不同的函数实现的。
 
-#####inode对象#####
+#### inode对象
 
 ### <a name="chapter5"></a>4、信号驱动IO模型
 
