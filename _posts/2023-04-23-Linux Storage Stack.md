@@ -221,6 +221,238 @@ struct super_block {
 
 #### inode对象
 
+　　inode对象定义了单个文件的元信息，例如最后修改时间、最后访问时间等等，同时还定义了一连串函数指针，这些函数指针指向具体文件系统的对文件操作的函数，可以说文件系统最核心的功能全部由inode的函数指针提供接口，包括常见的open,read,write,sync,close等等文件操作，都在inode的i_op字段里定义了统一的接口函数。
+
+	struct inode {
+		umode_t			i_mode;
+		unsigned short		i_opflags;
+		kuid_t			i_uid;
+		kgid_t			i_gid;
+		unsigned int		i_flags;
+	#ifdef CONFIG_FS_POSIX_ACL
+		struct posix_acl	*i_acl;
+		struct posix_acl	*i_default_acl;
+	#endif
+		const struct inode_operations	*i_op;
+		struct super_block	*i_sb;
+		struct address_space	*i_mapping;
+	#ifdef CONFIG_SECURITY
+		void			*i_security;
+	#endif
+		/* Stat data, not accessed from path walking */
+		unsigned long		i_ino;
+		/*
+		 * Filesystems may only read i_nlink directly.  They shall use the
+		 * following functions for modification:
+		 *
+		 *    (set|clear|inc|drop)_nlink
+		 *    inode_(inc|dec)_link_count
+		 */
+		union {
+			const unsigned int i_nlink;
+			unsigned int __i_nlink;
+		};
+		dev_t			i_rdev;
+		loff_t			i_size;
+		struct timespec		i_atime;
+		struct timespec		i_mtime;
+		struct timespec		i_ctime;
+		spinlock_t		i_lock;	/* i_blocks, i_bytes, maybe i_size */
+		unsigned short          i_bytes;
+		unsigned int		i_blkbits;
+		blkcnt_t		i_blocks;
+	#ifdef __NEED_I_SIZE_ORDERED
+		seqcount_t		i_size_seqcount;
+	#endif
+		/* Misc */
+		unsigned long		i_state;
+		struct mutex		i_mutex;
+		unsigned long		dirtied_when;	/* jiffies of first dirtying */
+		struct hlist_node	i_hash;
+		struct list_head	i_wb_list;	/* backing dev IO list */
+		struct list_head	i_lru;		/* inode LRU list */
+		struct list_head	i_sb_list;
+		union {
+			struct hlist_head	i_dentry;
+			struct rcu_head		i_rcu;
+		};
+		u64			i_version;
+		atomic_t		i_count;
+		atomic_t		i_dio_count;
+		atomic_t		i_writecount;
+		const struct file_operations	*i_fop;	/* former ->i_op->default_file_ops */
+		struct file_lock	*i_flock;
+		struct address_space	i_data;
+	#ifdef CONFIG_QUOTA
+		struct dquot		*i_dquot[MAXQUOTAS];
+	#endif
+		struct list_head	i_devices;
+		union {
+			struct pipe_inode_info	*i_pipe;
+			struct block_device	*i_bdev;
+			struct cdev		*i_cdev;
+		};
+		__u32			i_generation;
+	#ifdef CONFIG_FSNOTIFY
+		__u32			i_fsnotify_mask; /* all events this inode cares about */
+		struct hlist_head	i_fsnotify_marks;
+	#endif
+	#ifdef CONFIG_IMA
+		atomic_t		i_readcount; /* struct files open RO */
+	#endif
+		void			*i_private; /* fs or device private pointer */
+	};
+
+　除了i_op外，介绍几个重要的字段：
+
+1. `i_state`表示inode的状态，主要是表示inode是否是脏的。一般的文件系统在磁盘上都有相应的inode数据块，内核的inode结构便是这个磁盘数据块的内存缓存，所以与superblock一样，也是需要定期写回磁盘的，否则会导致数据丢失。  
+2. `i_list`把操作系统里的某些inode用双向循环链表连接起来，该字段指向相应链表的前一个元素和后一个元素。内核中有好几个关于inode的链表，所有inode必定出现在其中的某个链表内。第一个链表是有效未使用链表，链表里的inode都是非脏的，并且没有被引用，仅仅是作为高速缓存存在。第二个链表是正在使用链表，inode不为脏，但i_count字段为整数，表示被某些进程引用了。第三个链表是脏链表，由superblock的s_dirty字段引用。
+3. `i_sb_list`存放了超级块对象的s_inodes字段引用的链表的前一个元素和后一个元素。
+4. 所有的inode都存放在一个inode_hashtable的哈希表中，key是inode编号和超级块对象的地址计算出来的，作为高速缓存。因为哈希表可能会存在冲突，`i_hash`字段也是维护了链表指针，就指向同一个哈希地址的前一个inode和后一个inode。
+
+#### dentry对象
+
+　　dentry代表目录项，因为每一个文件必定存在于某个目录内，我们通过路径去查找一个文件，最终必定最终找到某个目录项。在linux里，目录与普通文件一样，往往都是存放在磁盘的数据块中，在查找目录的时候就读出该目录所在的数据块，然后去寻找其中的某个目录项。如果不存在硬链接，其实dentry是没有必要的，仅仅通过inode就能确定文件。但多个路径有可能指向同一个文件，所以vfs还抽象出了一个dentry的对象，一个或多个dentry对应一个inode。
+
+	struct dentry {
+		/* RCU lookup touched fields */
+		unsigned int d_flags;		/* protected by d_lock */
+		seqcount_t d_seq;		/* per dentry seqlock */
+		struct hlist_bl_node d_hash;	/* lookup hash list */
+		struct dentry *d_parent;	/* parent directory */
+		struct qstr d_name;
+		struct inode *d_inode;		/* Where the name belongs to - NULL is
+						 * negative */
+		unsigned char d_iname[DNAME_INLINE_LEN];	/* small names */
+		/* Ref lookup also touches following */
+		struct lockref d_lockref;	/* per-dentry lock and refcount */
+		const struct dentry_operations *d_op;
+		struct super_block *d_sb;	/* The root of the dentry tree */
+		unsigned long d_time;		/* used by d_revalidate */
+		void *d_fsdata;			/* fs-specific data */
+		struct list_head d_lru;		/* LRU list */
+		/*
+		 * d_child and d_rcu can share memory
+		 */
+		union {
+			struct list_head d_child;	/* child of parent list */
+		 	struct rcu_head d_rcu;
+		} d_u;
+		struct list_head d_subdirs;	/* our children */
+		struct hlist_node d_alias;	/* inode alias list */
+	};
+
+　　介绍几个重要的字段：
+
+1. `d_inode`指向该dentry对应的inode，找到了dentry就可以通过它找到inode。
+2. 同一个inode的所有dentry都在一个链表内，`d_alias`指向该链表的前一个和后一个元素。
+3. `d_op`定义了一些关于目录项的函数指针，指向具体文件系统的函数。
+
+　　dentry必须放在高速缓存中加速。vfs把所有的dentry都放到dentry_hashtable这个哈希表中，key就是由目录项对象和文件名哈希产生。目录项高速缓存采用LRU双向链表来进行缓存添加与释放。
+
+#### file对象
+
+　　作为应用程序的开发者或使用者，我们平时能接触到的vfs对象就只有`file`对象。我们平常说的打开文件，实际上就是让内核去创建一个`file`对象，并返回给我们一个文件描述符。出于隔离性的考虑，内核不可能把`file`对象的地址传给我们，我们只能通过文件描述符去间接地访问`file`对象。
+
+	struct file {
+		/*
+		 * fu_list becomes invalid after file_free is called and queued via
+		 * fu_rcuhead for RCU freeing
+		 */
+		union {
+			struct list_head	fu_list;
+			struct rcu_head 	fu_rcuhead;
+		} f_u;
+		struct path		f_path;
+	#define f_dentry	f_path.dentry
+		struct inode		*f_inode;	/* cached value */
+		const struct file_operations	*f_op;
+		/*
+		 * Protects f_ep_links, f_flags.
+		 * Must not be taken from IRQ context.
+		 */
+		spinlock_t		f_lock;
+	#ifdef __GENKSYMS__
+	#ifdef CONFIG_SMP
+		int			f_sb_list_cpu;
+	#endif
+	#else
+	#ifdef CONFIG_SMP
+		int			f_sb_list_cpu_deprecated;
+	#endif
+	#endif
+		atomic_long_t		f_count;
+		unsigned int 		f_flags;
+		fmode_t			f_mode;
+		loff_t			f_pos;
+		struct fown_struct	f_owner;
+		const struct cred	*f_cred;
+		struct file_ra_state	f_ra;
+		u64			f_version;
+	#ifdef CONFIG_SECURITY
+		void			*f_security;
+	#endif
+		/* needed for tty driver, and maybe others */
+		void			*private_data;
+	#ifdef CONFIG_EPOLL
+		/* Used by fs/eventpoll.c to link all the hooks to this file */
+		struct list_head	f_ep_links;
+		struct list_head	f_tfile_llink;
+	#endif /* #ifdef CONFIG_EPOLL */
+		struct address_space	*f_mapping;
+	#ifdef CONFIG_DEBUG_WRITECOUNT
+		unsigned long f_mnt_write_state;
+	#endif
+	#ifndef __GENKSYMS__
+		struct mutex		f_pos_lock;
+	#endif
+	};
+
+1. `f_inode`指向对应的inode对象。
+2. `f_dentry`指向对应的dentry对象。
+3. `f_pos`表示当前文件的偏移，可见文件偏移是每个file对象都有自己的独立的文件偏移量。
+4. `f_op`表示当前文件相关的所有函数指针，实际上在文件open的时候f_op会全部赋值为`i_op`相应的函数指针。
+
+　　由于file对象是由内核进程直接管理的，我们有必要了解一下进程如何管理打开的文件。首先，每个进程有一个`fs_struc`的字段：
+
+	struct fs_struct {
+		int users;
+		spinlock_t lock;
+		seqcount_t seq;
+		int umask;
+		int in_exec;
+		struct path root, pwd;
+	};
+	struct path {
+		struct vfsmount *mnt;
+		struct dentry *dentry;
+	};
+
+　　我们看到，每个进程都维护一个根目录和当前工作目录的信息，每一个目录由`vfsmount`和`dentry`组合唯一确定，`dentry`代表目录项前面已经说到，`vfsmount`则代表相应目录项所在文件系统的挂载信息，会在后面展开介绍一下。
+
+　　然后，每个进程都有当前打开的文件表，存放在进程的`files_struct`结构中。
+
+	struct files_struct {
+	  /*
+	   * read mostly part
+	   */
+		atomic_t count;
+		struct fdtable __rcu *fdt;
+		struct fdtable fdtab;
+	  /*
+	   * written part on a separate cache line in SMP
+	   */
+		spinlock_t file_lock ____cacheline_aligned_in_smp;
+		int next_fd;
+		unsigned long close_on_exec_init[1];
+		unsigned long open_fds_init[1];
+		struct file __rcu * fd_array[NR_OPEN_DEFAULT];
+	};
+
+　　我们只要关注一下`fd_array`这个数组就行，这个数组就存储了所有打开的file对象，我们应用程序拿到的文件描述符实际上就只是这个数组的索引。
+
+#### vfs管理文件系统的注册与挂载
+
 ### <a name="chapter5"></a>4、信号驱动IO模型
 
 信号驱动式I/O：首先我们允许Socket进行信号驱动IO,并安装一个信号处理函数，进程继续运行并不阻塞。当数据准备好时，进程会收到一个SIGIO信号，可以在信号处理函数中调用I/O操作函数处理数据。过程如下图所示：
