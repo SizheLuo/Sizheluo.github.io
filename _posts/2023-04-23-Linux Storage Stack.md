@@ -16,7 +16,7 @@ IO是操作系统内核最重要的组成部分之一，它的概念很广，本
 * [linux io体系结构](#chapter2)
 * [从Hello world说起](#chapter3)
 * [虚拟文件系统（VFS）](#chapter4)
-* [信号驱动IO模型](#chapter5)
+* [高速缓存](#chapter5)
 * [异步IO模型](#chapter6)
 * [信号驱动IO模型](#chapter7)
 * [异步IO模型](#chapter8)
@@ -453,7 +453,252 @@ struct super_block {
 
 #### vfs管理文件系统的注册与挂载
 
-### <a name="chapter5"></a>4、信号驱动IO模型
+　　前面介绍了vfs的4种对象，所有能在linux上使用的文件系统都必须实现这4种对象接口，实际上就是实现`s_op`, `i_op`, `d_op`这3组函数（`f_op`简单地复制`i_op`），这样vfs才能正常地使用文件系统进行工作。假设我们已经按照这个接口开发了一套文件系统，这时候又面临了一个问题，vfs怎么去识别我们的文件系统呢？我们的文件系统是如何注册和挂载到vfs上的呢？
+
+##### 文件系统注册
+
+　　文件系统要么是固化在内核代码中的，要么是通过内核模块动态加载的，在内核代码中的随着操作系统启动会自动注册，而通过内核模块动态加载的也可以用操作系统的启动参数配置成自动注册，或者我们可以人为地执行类似这样的命令`insmod fuse.ko`去动态注册，这里的fuse.ko就是fuse文件系统编译链接出来的二进制文件。
+
+	struct file_system_type {
+		const char *name;
+		int fs_flags;
+	#define FS_REQUIRES_DEV		1 
+	#define FS_BINARY_MOUNTDATA	2
+	#define FS_HAS_SUBTYPE		4
+	#define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+	#define FS_USERNS_DEV_MOUNT	16 /* A userns mount does not imply MNT_NODEV */
+	#define FS_HAS_RM_XQUOTA	256	/* KABI: fs has the rm_xquota quota op */
+	#define FS_HAS_INVALIDATE_RANGE	512	/* FS has new ->invalidatepage with length arg */
+	#define FS_HAS_DIO_IODONE2	1024	/* KABI: fs supports new iodone */
+	#define FS_HAS_NEXTDQBLK	2048	/* KABI: fs has the ->get_nextdqblk op */
+	#define FS_HAS_DOPS_WRAPPER	4096	/* kabi: fs is using dentry_operations_wrapper. sb->s_d_op points to
+	dentry_operations_wrapper */
+	#define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
+		struct dentry *(*mount) (struct file_system_type *, int,
+			       const char *, void *);
+		void (*kill_sb) (struct super_block *);
+		struct module *owner;
+		struct file_system_type * next;
+		struct hlist_head fs_supers;
+		struct lock_class_key s_lock_key;
+		struct lock_class_key s_umount_key;
+		struct lock_class_key s_vfs_rename_key;
+		struct lock_class_key s_writers_key[SB_FREEZE_LEVELS];
+		struct lock_class_key i_lock_key;
+		struct lock_class_key i_mutex_key;
+		struct lock_class_key i_mutex_dir_key;
+	};
+
+　　在注册文件系统的时候，我们需要提交一个`file_system_type`,这个对象主要有一个`get_sb`（linux kernel 2.6）或者是`mount`（linux kernel 3.1）对象，这个是一个函数指针，主要是分配superblock的，每当该类型的文件系统挂载时，就会调用该函数分配superblock对象。`fs_supers`引用了所有属于该文件系统类型的superblock对象。内核把所有注册的文件系统类型维护成一个链表，`file_system_type`的`next`字段指向链表的下一个元素。
+
+##### 文件系统挂载
+
+　　正常情况下，操作系统启动后，常用的文件系统类型都是自动注册的，不需要用户干预。但一个块设备要以某文件系统的形式被操作系统识别的话，需要挂载到某个目录下，例如执行如下的挂载命令：
+
+	mount -t xfs /dev/sdb /var/cold-storage/
+
+　　当执行这条命令以后，内核会首先分配一个vfsmount的对象，该对象唯一标识一个挂载的文件系统。
+
+	struct vfsmount {
+		struct dentry *mnt_root;	/* root of the mounted tree */
+		struct super_block *mnt_sb;	/* pointer to superblock */
+		int mnt_flags;
+	};
+
+　　`vfsmount`主要存放了该文件系统的superblock对象以及该文件系统根目录（上例的/var/cold-storage/）的dentry对象，一开始superblock对象是空的。
+
+　　有可能这个文件系统会被挂载了多次，之前已经被挂载到其他目录上了，就意味着其superblock对象已经被分配，因此内核会先搜索`file_system_type`的`fs_supers`链表，如果找到，就直接用该superblock对象赋值给新的`vfsmount`对象的`mnt_sb`字段。
+
+　　如果这个文件系统是第一次被挂载，则调用注册的`file_system_type`的`get_sb`或者`mount`函数，分配新的superblock对象。
+
+　　当superblock对象确定了以后，该文件系统就被挂载成功，可以正常使用了。
+
+　　所有的`vfsmount`都会存放在`mount_hashtable`的哈希表中，key是`vfsmount`地址以及dentry地址计算出来的哈希值。
+
+#### 以open系统调用为例小结vfs的基本知识
+
+　　在继续探究`vfs_read`和`vfs_write`之前，先通过open系统调用去串连一下vfs层的4个对象，小结一下前面的内容。因为open调用仅仅涉及到vfs层，跟磁盘高速缓存以及具体文件系统的实现基本无关。
+
+　　回忆一下前面的hello world例子，在进行文件拷贝前，先要open文件：
+
+	fd1 = open("helloworld.in", O_RONLY);
+	fd2 = open("helloworld.out", O_WRONLY);
+
+　　这里核心的任务就是要通过传入的路径参数，最终创建出vfs的file对象。file对象确定了以后，意味着对应的inode,dentry和superblock也确定了，4大vfs对象全都准备后，可以接受读写请求了。最后返回其在内核进程的文件打开数组里的索引号给上层用户进程。具体步骤如下：
+
+##### 路径查找
+
+　　首先进行路径查找，调用`path_lookup()`函数。该函数主要接受两个参数，一个是路径名，一个是nameidata类型的结构体,这个结构体有一个比较重要的字段是path，主要分析这个字段，在路径查找的过程中会不断修改这个字段，最后这个字段就代表路径查找的最终结果。该字段利用`vfsmount`和`dentry`唯一确定了某个路径。
+
+	struct path {
+		struct vfsmount *mnt;
+		struct dentry *dentry;
+	};
+
+1. 首先判断路径是绝对路径还是相对路径，决定用进程的root还是pwd字段去填充这个path结构体，作为起始参数。
+2. 用/去划分路径，依次解析每一层路径，对于每一层路径，首先找出其目录项的dentry对象，大概率会在目录项高速缓存中命中，如果缓存中没有，则读取磁盘，然后放到缓存中，并更新path字段。
+3. 检查该层目录的dentry是否是某文件系统的挂载点，如果是,则用当前path的vfsmount和dentry计算哈希值，找出mount_hashtable中的子文件系统的`vfsmount`和`dentry`，并更新path的`vfsmount`和`dentry`。
+4. 直到把所有分路径都解析完成，获得了最后的path。
+
+##### 创建file对象
+
+　　找到了目的路径的`vfsmount`和`dentry`，inode和superblock对象也相应确定了，剩下的工作就是分配一个新的文件对象，并把相应的字段用inode，dentry和vfsmount的地址去填充。
+
+#### vfs_read, vfs_write
+
+　　现在，我们已经有了足够的vfs知识，可以探索一下前面hello_world程序里的vfs_read和vfs_write函数了。
+
+	SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+	{
+		struct fd f = fdget_pos(fd);
+		ssize_t ret = -EBADF;
+		if (f.file) {
+			loff_t pos = file_pos_read(f.file);
+			ret = vfs_read(f.file, buf, count, &pos);
+			file_pos_write(f.file, pos);
+			fdput_pos(f);
+		}
+		return ret;
+	}
+	SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
+			size_t, count)
+	{
+		struct fd f = fdget_pos(fd);
+		ssize_t ret = -EBADF;
+		if (f.file) {
+			loff_t pos = file_pos_read(f.file);
+			ret = vfs_write(f.file, buf, count, &pos);
+			file_pos_write(f.file, pos);
+			fdput_pos(f);
+		}
+		return ret;
+	}
+	ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+	{
+		ssize_t ret;
+		if (!(file->f_mode & FMODE_READ)) 
+			return -EBADF;
+		if (!file->f_op || (!file->f_op->read && !file->f_op->aio_read))  
+			return -EINVAL;
+		if (unlikely(!access_ok(VERIFY_WRITE, buf, count)))  
+			return -EFAULT;
+		ret = rw_verify_area(READ, file, pos, count);
+		if (ret >= 0) {
+			count = ret;
+			if (file->f_op->read)    
+				ret = file->f_op->read(file, buf, count, pos);
+			else
+				ret = do_sync_read(file, buf, count, pos);
+			if (ret > 0) {
+				fsnotify_access(file);
+				add_rchar(current, ret);
+			}
+			inc_syscr(current);
+		}
+		return ret;
+	}
+	ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+	{
+		ssize_t ret;
+		if (!(file->f_mode & FMODE_WRITE))
+			return -EBADF;
+		if (!file->f_op || (!file->f_op->write && !file->f_op->aio_write))
+			return -EINVAL;
+		if (unlikely(!access_ok(VERIFY_READ, buf, count)))
+			return -EFAULT;
+		ret = rw_verify_area(WRITE, file, pos, count);
+		if (ret >= 0) {
+			count = ret;
+			file_start_write(file);
+			if (file->f_op->write)
+				ret = file->f_op->write(file, buf, count, pos);    
+			else
+				ret = do_sync_write(file, buf, count, pos);
+			if (ret > 0) {
+				fsnotify_modify(file);
+				add_wchar(current, ret);
+			}
+			inc_syscw(current);
+			file_end_write(file);
+		}
+		return ret;
+	}
+
+　　可以看到，read，write系统调用会根据文件描述符提取出file对象，这个file对象是在Open调用里已经创建好的。然后会在file对象中读取出当前的文件偏移量，读写都会从这个偏移量开始。然后把file对象，用户层buffer的地址，要读写的大小，以及文件偏移量作为参数传入`vfs_read`和`vfs_write`中。这两个函数主要是对file对象的相应文件系统的读写函数进行封装，因此，主要的逻辑就过渡到了具体文件系统上了。具体文件系统的实现逻辑各不相同，但都要以vfs的4大对象为对外的接口，然后再定义自己的数据结构与方法。
+
+　　对于通用的磁盘文件系统，linux提供了很多基本的函数，很多文件系统的核心功能都是以这些基本函数为基础，再封装一层而已。我们就以常用的xfs文件系统为例，去简单看看它的read和write函数干了什么。
+
+	const struct file_operations xfs_file_operations = {
+		.llseek		= xfs_file_llseek,
+		.read		= do_sync_read,
+		.write		= do_sync_write,
+		.aio_read	= xfs_file_aio_read,
+		.aio_write	= xfs_file_aio_write,
+		.splice_read	= xfs_file_splice_read,
+		.splice_write	= xfs_file_splice_write,
+		.unlocked_ioctl	= xfs_file_ioctl,
+	#ifdef CONFIG_COMPAT
+		.compat_ioctl	= xfs_file_compat_ioctl,
+	#endif
+		.mmap		= xfs_file_mmap,
+		.open		= xfs_file_open,
+		.release	= xfs_file_release,
+		.fsync		= xfs_file_fsync,
+		.fallocate	= xfs_file_fallocate,
+	};
+
+　　这是xfs的f_op的函数指针表，可以看到，它的read,write函数竟然直接用了内核提供的函数，非常偷懒！
+
+	ssize_t do_sync_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos)
+	{
+		struct iovec iov = { .iov_base = buf, .iov_len = len };  
+		struct kiocb kiocb;
+		ssize_t ret;
+		init_sync_kiocb(&kiocb, filp);
+		kiocb.ki_pos = *ppos;
+		kiocb.ki_left = len;
+		kiocb.ki_nbytes = len;
+		ret = filp->f_op->aio_read(&kiocb, &iov, 1, kiocb.ki_pos);  
+		if (-EIOCBQUEUED == ret)
+			ret = wait_on_sync_kiocb(&kiocb);
+		*ppos = kiocb.ki_pos;
+		return ret;
+	}
+	ssize_t do_sync_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
+	{
+		struct iovec iov = { .iov_base = (void __user *)buf, .iov_len = len };
+		struct kiocb kiocb;
+		ssize_t ret;
+		init_sync_kiocb(&kiocb, filp);
+		kiocb.ki_pos = *ppos;
+		kiocb.ki_left = len;
+		kiocb.ki_nbytes = len;
+		ret = filp->f_op->aio_write(&kiocb, &iov, 1, kiocb.ki_pos);    
+		if (-EIOCBQUEUED == ret)
+			ret = wait_on_sync_kiocb(&kiocb);
+		*ppos = kiocb.ki_pos;
+		return ret;
+	}
+
+　　这两个函数实际上调用了具体文件系统的aio_read和aio_write函数，而xfs文件系统的这两个函数是自定义的，xfs_file_aio_read和xfs_file_aio_write。
+
+　　这两个函数的代码就有点复杂了，不过我们不需要细究xfs的实现细节，我们的目的是要通过xfs文件系统去找出通用的磁盘文件系统的共性，xfs_file_aio_read和xfs_file_aio_write虽然有很多xfs自己的实现细节，但其核心功能都是建立在内核提供的通用函数上的，例如xfs_file_aio_read最终会调用generic_file_aio_read函数，而xfs_file_aio_write则最终会调用generic_perform_write函数。这些通用函数是基本上所有文件系统的核心逻辑。
+
+　　进入到这里，就开始涉及到高速缓存这一层了。我们先立足于vfs这一层，然后预热一下高速缓存层，先直接概括一下generic_file_aio_read函数做了什么事情，非常简单：
+
+1. 根据文件偏移量计算出在要读的内容在高速缓存中的位置。
+2. 搜索高速缓存，看看要读的内容是否在高速缓存中存在，若存在则直接返回，若不存在则触发读磁盘任务。若触发读磁盘任务，则判断当前是否顺序读，尽量预读取磁盘数据到高速缓存中，减少磁盘io的次数。
+3. 数据读取后，拷贝到用户态的buffer中。
+
+　　`generic_perform_write`的逻辑则是：
+
+1. 根据文件偏移量计算出在要写的内容在高速缓存中的位置。
+2. 搜索看看要写的内容是否已在高速缓存中分配了相应的数据结构，若没有，则分配相应内存空间。
+3. 从用户态的buffer拷贝数据到高速缓存中。
+4. 检查高速缓存中的空间是否用得太多，如果占用过多内存则唤醒后台的写回磁盘的线程，把高速缓存的部分内容写回到磁盘上，可能会造成不定时间的写阻塞。
+5. 向上层返回写的结果。
+
+### <a name="chapter5"></a>高速缓存
 
 信号驱动式I/O：首先我们允许Socket进行信号驱动IO,并安装一个信号处理函数，进程继续运行并不阻塞。当数据准备好时，进程会收到一个SIGIO信号，可以在信号处理函数中调用I/O操作函数处理数据。过程如下图所示：
 
