@@ -18,10 +18,11 @@ IO是操作系统内核最重要的组成部分之一，它的概念很广，本
 * [虚拟文件系统（VFS）](#chapter4)
 * [高速缓存](#chapter5)
 * [通用块层](#chapter6)
-* [信号驱动IO模型](#chapter7)
-* [异步IO模型](#chapter8)
-* [信号驱动IO模型](#chapter9)
-* [异步IO模型](#chapter10)
+* [IO调度程序层](#chapter7)
+* [设备驱动层](#chapter8)
+* [块设备文件](#chapter9)
+* [写回机制](#chapter10)
+* [open系统调用的关键参数解析](#chapter11)
 
 ### <a name="chapter1"></a>文件与存储
 
@@ -773,14 +774,437 @@ struct super_block {
 
 ### <a name="chapter6"></a>通用块层
 
-相对于同步IO，异步IO不是顺序执行。用户进程进行aio_read系统调用之后，无论内核数据是否准备好，都会直接返回给用户进程，然后用户态进程可以去做别的事情。等到socket数据准备好了，内核直接复制数据给进程，然后从内核向进程发送通知。IO两个阶段，进程都是非阻塞的。异步过程如下图所示：
+　　前面说到，高速缓存这一层分为page cache和buffer cache，buffer cache是建立在page cache之上的。page cache是面向文件的抽象，而buffer cache则是面向块设备的抽象。由于我们对文件的读写请求最终还是会转化成对磁盘（块设备）的读写请求，这种请求是要落到磁盘扇区的。
 
-![](https://s3.uuu.ovh/imgs/2023/04/08/2ca15f43fc8b9e37.png)
+![](https://wjqwsp.github.io/img/sector-block.png)
+
+　　从buffer_head的结构中可以看到，每一个buffer cache都有一个磁盘的逻辑块号，这个磁盘块是文件系统的块号，每一个磁盘块可以包含一个或多个扇区，这取决于buffer cache的大小（文件系统格式化时的块大小）。所以，buffer cache的大小是连续分配磁盘大小的最小单位。但对于大多数情况，整个page都会映射到连续的磁盘区域，因此page的大小将成为一般情况下的连续分配磁盘的最小单位。
+
+　　当从高速缓存中读某个page发现该页不存在时，就会从高速缓存层进入通用块层，向块设备去提交读磁盘的请求。通用块层就是起到了从高速缓存到块设备的桥梁作用。
+
+#### 通用块层的核心–bio
+
+　　掌握通用块层只需要掌握一个数据结构–bio,它是通用块层逻辑的核心，它描述了从高速缓存层提交的一次IO请求。
+
+	struct bio {
+		sector_t		bi_sector;	/* device address in 512 byte
+							   sectors */
+		struct bio		*bi_next;	/* request queue link */
+		struct block_device	*bi_bdev;
+		unsigned long		bi_flags;	/* status, command, etc */
+		unsigned long		bi_rw;		/* bottom bits READ/WRITE,
+							 * top bits priority
+							 */
+		unsigned short		bi_vcnt;	/* how many bio_vec's */
+		unsigned short		bi_idx;		/* current index into bvl_vec */
+		/* Number of segments in this BIO after
+		 * physical address coalescing is performed.
+		 */
+		unsigned int		bi_phys_segments;
+		unsigned int		bi_size;	/* residual I/O count */
+		/*
+		 * To keep track of the max segment size, we account for the
+		 * sizes of the first and last mergeable segments in this bio.
+		 */
+		unsigned int		bi_seg_front_size;
+		unsigned int		bi_seg_back_size;
+		bio_end_io_t		*bi_end_io;
+		void			*bi_private;
+	#ifdef CONFIG_BLK_CGROUP
+		/*
+		 * Optional ioc and css associated with this bio.  Put on bio
+		 * release.  Read comment on top of bio_associate_current().
+		 */
+		struct io_context	*bi_ioc;
+		struct cgroup_subsys_state *bi_css;
+	#endif
+	#if defined(CONFIG_BLK_DEV_INTEGRITY)
+		struct bio_integrity_payload *bi_integrity;  /* data integrity */
+	#endif
+		/*
+		 * Everything starting with bi_max_vecs will be preserved by bio_reset()
+		 */
+		unsigned int		bi_max_vecs;	/* max bvl_vecs we can hold */
+		atomic_t		bi_cnt;		/* pin count */
+		struct bio_vec		*bi_io_vec;	/* the actual vec list */
+		struct bio_set		*bi_pool;
+		/* FOR RH USE ONLY
+		 *
+		 * The following padding has been replaced to allow extending
+		 * the structure, using struct bio_aux, while preserving ABI.
+		 */
+		RH_KABI_REPLACE(void *rh_reserved1, struct bio_aux *bio_aux)
+		/*
+		 * We can inline a number of vecs at the end of the bio, to avoid
+		 * double allocations for a small number of bio_vecs. This member
+		 * MUST obviously be kept at the very end of the bio.
+		 */
+		struct bio_vec		bi_inline_vecs[0];
+	};
+
+1. `bi_sector`代表这次IO请求的的磁盘扇区号。对于buffer cache，可以通过b_blocknr * b_size / 512计算得到。如果是page cache，则稍微复杂一点，不过page的第一个磁盘块的逻辑块号也能通过文件的元信息间接计算得到。
+2. `bio_io_vec`记录了高速缓存层要提交给磁盘的数据。一个`bio_io_vec`可看作一个连续的内存段。
+3. `bi_vcnt`代表内存段的数目。
+4. `bi_idx`代表当前已经传输到哪个内存段了，这个字段会在传输过程中被修改。
+5. `bi_bdev`表示该请求指向哪个块设备。
+6. `bi_rw`表示是读还是写请求。
+
+	struct bio_vec { 
+	/* pointer to the physical page on which this buffer resides */ 
+	struct page *bv_page;
+	/* the length in bytes of this buffer */ 
+	unsigned int bv_len;
+	/* the byte offset within the page where the buffer resides */ 
+	unsigned int bv_offset;
+	};
+
+![](https://wjqwsp.github.io/img/bio-vec.png)
+
+　　不管是buffer cache还是Page cache，它们要提交读写磁盘的请求时，都要把数据封装成bio_vec的形式，然后放到bio结构内。
+
+#### 读page请求
+
+　　回忆之前讲到的vfs层的读请求，是以page为单位读取高速缓存的。如果某个page不在高速缓存中，那么就会调用文件系统定义的read_page函数。
+
+　　以下xfs定义的针对page一级的函数列表：
+
+	const struct address_space_operations xfs_address_space_operations = {
+		.readpage		= xfs_vm_readpage,
+		.readpages		= xfs_vm_readpages,
+		.writepage		= xfs_vm_writepage,
+		.writepages		= xfs_vm_writepages,
+		.set_page_dirty		= xfs_vm_set_page_dirty,
+		.releasepage		= xfs_vm_releasepage,
+		.invalidatepage_range	= xfs_vm_invalidatepage,
+		.write_begin		= xfs_vm_write_begin,
+		.write_end		= xfs_vm_write_end,
+		.bmap			= xfs_vm_bmap,
+		.direct_IO		= xfs_vm_direct_IO,
+		.migratepage		= buffer_migrate_page,
+		.is_partially_uptodate  = block_is_partially_uptodate,
+		.error_remove_page	= generic_error_remove_page,
+	};
+
+　　xfs的read_page函数是`xfs_vm_readpage`。我们不打算去探究该函数的代码细节，而是直接概括一下对于大部分文件系统，read_page函数的核心业务是什么，`xfs_vm_readpage`也只是在这个核心业务的基础上再添加自己的逻辑而已。
+
+1. 检查page的PG_private字段，如果是1，则该页被用于buffer cache，就会对该页的每一个buffer cache都生成一个bio结构，提交给下一层。
+2. 如果该page是一般的page，则根据文件元信息计算该page的第一个文件块的块号以及块数目。
+3. 分配新的bio结构，用page cache或者buffer cache的元信息初始化`bi_sector`，`bi_size`，`bi_bdev`，`bi_io_vec`，`bi_rw`等字段。
+4. 可能要对`bi_bdev`进行remap，然后再将bio提交给下一层。
+
+　　所谓的块设备remap，是要进行块设备的逻辑分区到磁盘的映射。一个文件系统是安装在逻辑分区上，所以我们的读写请求所对应的逻辑扇区号都是相对于逻辑分区而言的。但是，块设备在进行读写的时候是相对于整个物理磁盘来寻址的，因此在构建bio的时候，要进行逻辑分区到物理磁盘的remap。
+
+　　`bi_bdev`指向的是block_device的结构，无论是逻辑分区还是物理磁盘都是用这个结构来表示。它主要有两个字段跟remap相关的，分别是`bi_contains`以及bd_part。bi_contains指向该分区所在的物理磁盘的`bi_bdev`，如果该分区是逻辑分区，那么可以通过该字段找到物理磁盘的`bi_bdev`结构。`bd_part`则保存了物理磁盘的分区描述符`hd_struct`，可以通过该结构完成逻辑分区扇区号到整个物理磁盘扇区号的映射。
+
+　　可以看到，read_page函数的核心逻辑非常简单。不过，高速缓存一般都是采用预读的策略来读page的，因此一次会读多个page，此时一般会调用文件系统的read_pages函数，该函数会生成多个内存段的bio，即带有多个`bio_io_vec`，把连续的磁盘块一次读出来，减少io次数。
+
+![](https://wjqwsp.github.io/img/block-device.png)
+
+### <a name="chapter7"></a>IO调度程序层
+
+　　通用块层构建了bio之后，会提交给下一层，但这个下一层还并没有到达硬件，还需要经过一层io调度。通用块层实际上把bio请求提交给了IO调度层。IO调度层的存在主要是为了减小磁盘IO的次数，增大磁盘整体的吞吐量。因为多个bio之间可能是访问的连续的磁盘空间，如果把这些bio不经过排序重组就提交给硬件驱动程序，可能会造成很严重的随机读写现象，造成吞吐量下降。因此，IO调度层的任务就是要把bio进行排序和合并。linux内核里有几种不同的Io调度机制，可供用户选择，它们都有不同的优缺点，适合不同的应用场景。
+
+#### 请求队列与请求
+
+　　linux内核为每一个设备都维护了一个IO队列，这个队列用来填充上层提交的IO请求。在通用块层我们介绍了bio结构，每一个bio是高速缓存层提交的一个IO请求。而在IO调度层，则用request结构来表达IO请求。
+
+	struct request {
+	#ifdef __GENKSYMS__
+		union {
+			struct list_head queuelist;
+			struct llist_node ll_list;
+		};
+	#else
+		struct list_head queuelist;
+	#endif
+		union {
+			struct call_single_data csd;
+			RH_KABI_REPLACE(struct work_struct mq_flush_work,
+				        unsigned long fifo_time)
+		};
+		struct request_queue *q;
+		struct blk_mq_ctx *mq_ctx;
+		u64 cmd_flags;
+		enum rq_cmd_type_bits cmd_type;
+		unsigned long atomic_flags;
+		int cpu;
+		/* the following two fields are internal, NEVER access directly */
+		unsigned int __data_len;	/* total data len */
+		sector_t __sector;		/* sector cursor */
+		struct bio *bio;
+		struct bio *biotail;
+	#ifdef __GENKSYMS__
+		struct hlist_node hash;	/* merge hash */
+	#else
+		/*
+		 * The hash is used inside the scheduler, and killed once the
+		 * request reaches the dispatch list. The ipi_list is only used
+		 * to queue the request for softirq completion, which is long
+		 * after the request has been unhashed (and even removed from
+		 * the dispatch list).
+		 */
+		union {
+			struct hlist_node hash;	/* merge hash */
+			struct list_head ipi_list;
+		};
+	#endif
+		/*
+		 * The rb_node is only used inside the io scheduler, requests
+		 * are pruned when moved to the dispatch queue. So let the
+		 * completion_data share space with the rb_node.
+		 */
+		union {
+			struct rb_node rb_node;	/* sort/lookup */
+			void *completion_data;
+		};
+		/*
+		 * Three pointers are available for the IO schedulers, if they need
+		 * more they have to dynamically allocate it.  Flush requests are
+		 * never put on the IO scheduler. So let the flush fields share
+		 * space with the elevator data.
+		 */
+		union {
+			struct {
+				struct io_cq		*icq;
+				void			*priv[2];
+			} elv;
+			struct {
+				unsigned int		seq;
+				struct list_head	list;
+				rq_end_io_fn		*saved_end_io;
+			} flush;
+		};
+		struct gendisk *rq_disk;
+		struct hd_struct *part;
+		unsigned long start_time;
+	#ifdef CONFIG_BLK_CGROUP
+		struct request_list *rl;		/* rl this rq is alloced from */
+		unsigned long long start_time_ns;
+		unsigned long long io_start_time_ns;    /* when passed to hardware */
+	#endif
+		/* Number of scatter-gather DMA addr+len pairs after
+		 * physical address coalescing is performed.
+		 */
+		unsigned short nr_phys_segments;
+	#if defined(CONFIG_BLK_DEV_INTEGRITY)
+		unsigned short nr_integrity_segments;
+	#endif
+		unsigned short ioprio;
+		void *special;		/* opaque pointer available for LLD use */
+		char *buffer;		/* kaddr of the current segment if available */
+		int tag;
+		int errors;
+		/*
+		 * when request is used as a packet command carrier
+		 */
+		unsigned char __cmd[BLK_MAX_CDB];
+		unsigned char *cmd;
+		unsigned short cmd_len;
+		unsigned int extra_len;	/* length of alignment and padding */
+		unsigned int sense_len;
+		unsigned int resid_len;	/* residual count */
+		void *sense;
+		unsigned long deadline;
+		struct list_head timeout_list;
+		unsigned int timeout;
+		int retries;
+		/*
+		 * completion callback.
+		 */
+		rq_end_io_fn *end_io;
+		void *end_io_data;
+		/* for bidi */
+		struct request *next_rq;
+	};
+
+1. sector代表要传送的扇区号。
+2. nr_sectors代表整个请求要传送的扇区数。
+3. current_nr_sectors代表当前bio还需传输的扇区数。
+4. bio表示请求的第一个bio结构
+5. biotail表示请求的最后一个bio结构。
+
+　　上层提交的bio有可能会新分配一个request结构去存放，或者合并到现有的request结构中。
+
+　　在请求被处理时，下层的设备驱动程序有可能会修改request结构，使得bio总是指向当前未传输的第一个bio，并且会修改`nr_sectors`和`current_nr_sectors`字段。
+
+#### The Linus Elevator
+
+　　这个调度器是linux kernel 2.4的默认调度器，不过在2.6之后已经被淘汰了，不过其基本思想是其他调度器的基础，所以稍微介绍一下。
+
+1. 新请求到达时，先看看能不能与队列内已有的请求合并，凡是在磁盘内连续的都可以合并。
+2. 如果不能合并，则按照磁盘块的顺序插入到正确的位置，始终保持队列是有序的。
+3. 为了防止请求饿死，当发现有请求在队列的时间过长，将不执行任何合并与排序的优化，而是直接插入到队列末尾。
+
+　　优点：使得设备驱动器总是进行顺序读写，最大化了吞吐。  
+　　缺点：某些请求的延迟会较大，且有可能会饿死。虽然有一定的措施防止请求饿死，但策略还不完善，没有一个时间上的保证。
+
+#### Deadline
+
+　　Deadline调度器在继承了Linus Elevator调度器的优点的同时，还回避了它的缺点。
+
+![](https://wjqwsp.github.io/img/deadline.png)
+
+　　这个调度器维护了4个中间队列，其中sorted queue与Linus Elevator调度器的队列一样，根据磁盘块位置进行合并和排序, 不过对读写请求进行了区分，读请求和写请求分开排序，因此有两个排序队列。同时还另外增加了两个冗余队列，在请求插入sorted queue时，还会分别填充插入读请求或者写请求的超时队列。这两个冗余队列按照普通FIFO的逻辑，按时间排序。每一个请求都有一个超时时间，默认读请求的超时时间是500ms，写请求是5s。
+
+　　在一般情况下，磁盘的执行队列会从sorted queues里取出请求，优先从读请求排序队列里取，除非写请求排序队列被放弃多次。如果有读请求或者写请求超时，此时从相应的超时队列中取请求。之所以读写请求要分开队列，是因为读请求一般是同步的，对延迟更敏感，因此超时时间设得很短，并且优先级更高；而写请求一般是异步的，所以超时时间会更长，优先级较低。
+
+#### anticipatory
+
+　　deadline调度器有一个问题，就是它会在读写请求之间交互执行，并且优先读请求。这样当有读写混合负载时，会发生磁头来回抖动，大幅度降低吞吐。anticipatory调度器就是解决这个问题。
+
+　　这个调度器建立在deadline调度器的基础上，仍然有4个队列，核心逻辑都一样。不过在完成了一个读请求时，如果此时队列里还没有请求，则不会马上切换到写队列，而是停止一段时间（默认6ms）。由于大概率会有相邻的读请求到达，因此会减少磁头抖动的现象，对整体吞吐有好处。不过如果这段停止的时间没有读请求到达，这样就纯粹是浪费时间，因此anticipatory会根据相应进程和文件系统以往的一些统计信息去预测会不会有读请求到达，如果预测会有才会停止处理原本要处理的写请求。
+
+　　这个调度器是最复杂的，而且它的功能可以通过配置其他调度器达到相似的效果，因此在linux 2.6.33版本之后被删除了。
+
+#### CFQ
+
+　　叫做完全公平调度器。这个调度器的主要目标在于让磁盘带宽在所有进程中平均分配。该调度器使用多个排序队列（缺省64），当请求到达时，会把请求根据进程ID哈希到不同的队列，最终的调度队列会以轮询的方式扫描每一个排序队列取出请求。
+
+#### Noop
+
+　　最简单的调度器，基本不做什么，不排序，但还是会合并。新请求一般都是插入队尾，跟普通的FIFO差不多。一般用于随机读写较多，或者用户层本身已经做了请求排序和合并等优化的场景。
+
+### <a name="chapter8"></a>设备驱动层
+
+　　每一类块设备都有它的驱动程序，该驱动程序负责管理块设备的硬件读写，例如ide，scsi等设备都有自己的驱动程序，IO调度层的每一个请求实际上都会交给相应的设备驱动程序，让它们去执行硬件指令。大部分的磁盘驱动程序都采用DMA的方式去进行数据传输，DMA控制器自行在内存和IO设备间进行数据传送，当数据传送完成再通过中断通知CPU。
+
+#### scatter-gather传送方式
+
+　　DMA传送必须满足传送的数据都是磁盘上相邻扇区的。老式的磁盘控制器还有一个限制，就是磁盘必须与内存中的连续的内存区域传送数据。新的磁盘控制器则支持scatter-gather传送方式，即磁盘区域必须要连续，但可以同时传输多段不连续的内存段。
+
+　　设备驱动程序需要向磁盘控制器发送：
+
+1. 要传输的起始磁盘扇区号以及总扇区数。
+2. 内存区域链表，链表中的每项包含一个内存地址还有长度。
+
+　　这种scatter-gather的传送方式与bio以及request结构对于内存片段的管理是一致的，实际上通用块层以及IO调度层正是为了适配设备驱动程序的这种scatter-gather传送方式而使用bio以及request结构进行管理。request的请求的合并机制可以让一次DMA传送传输尽可能多的数据。
+
+#### 策略例程
+
+　　每一个请求队列都有自己的request_fn方法，该方法可以调用块设备驱动程序的函数进行数据传输，这些函数就叫做策略例程。
+
+　　设备驱动程序顺序地处理请求队列中的每一个请求，并设置在数据传送完成时产生中断。当中断产生时，中断程序重新调用策略例程，如果当前请求还没有全部完成，则重新发起请求，否则在请求队列中删除该请求，并处理下一个请求。
+
+　　如果块设备控制器支持scatter-gather的传送方式，那么设备驱动程序会一次提交整个request，否则会遍历request中的每一个bio，以及bio的每一个bio_io_vec，一段一段地传送。
+
+　　中断产生时，如果请求没有完全完成，设备驱动程序会修改以下字段：
+
+1. 修改bio字段使其指向第一个未完成的bio。
+2. 修改未完成的bio结构，使其bi_idx字段指向第一个未完成的bio_io_vec。
+3. 修改bio_io_vec的bv_offset以及bv_len，使其表示该内存段中仍需要传送的数据。
+
+### <a name="chapter9"></a>块设备文件
+
+　　以上的讲述基本上是针对普通文件的读写，但还有一种特殊的文件需要关注，就是设备文件（/dev/sda,/dev/sdb）。
+
+　　这些设备文件仍然由VFS进行管理，相当于一个特殊的文件系统。当进程访问设备文件时，将直接驱动设备驱动程序。缺省的块设备文件的函数表如下：
+
+	const struct file_operations def_blk_fops = {
+		.open		= blkdev_open,
+		.release	= blkdev_close,
+		.llseek		= block_llseek,
+		.read		= do_sync_read,
+		.write		= do_sync_write,
+		.aio_read	= blkdev_aio_read,
+		.aio_write	= blkdev_aio_write,
+		.mmap		= generic_file_mmap,
+		.fsync		= blkdev_fsync,
+		.unlocked_ioctl	= block_ioctl,
+	#ifdef CONFIG_COMPAT
+		.compat_ioctl	= compat_blkdev_ioctl,
+	#endif
+		.splice_read	= generic_file_splice_read,
+		.splice_write	= generic_file_splice_write,
+	};
+
+　　可以看到，VFS隐藏了底层文件系统的实现细节，如果是块设备的话，则会激活设备驱动程序的函数。
+
+　　每当文件系统被映射到磁盘或分区上，或者显式执行open()调用时，都会打开设备文件。设备文件也有自己的page cache，buffer cache。
+
+### <a name="chapter10"></a>写回机制
+
+　　最后介绍一下最为复杂的写回机制。前面我们讲述从通用块层到设备驱动层的时候，主要是以read为例子，由于读是同步的，往往一次读的调用将贯穿vfs到设备驱动层的整个IO体系。而对于写操作，这一般是异步的，一般从vfs到高速缓存层就会返回。但是新写的page不可能永远停留在内存，始终还是要写回磁盘的。当满足以下条件时，会触发高速缓存层的写回：
+
+1. 脏页缓存占用太多，内存空间不足。
+2. 脏页存在的时间过长。
+3. 用户强制刷新脏页。
+4. write写page时检查是否需要刷新。
+
+　　在Linux kernel 2.6之前写回是全局性的，一个线程负责所有磁盘的写回任务，这样将无法利用全部的磁盘带宽。新内核为每一个磁盘都建立一个线程，负责该磁盘的写回任务。
+
+#### 写回架构
+
+![](https://wjqwsp.github.io/img/backing-device-info.png)
+
+　　每一个磁盘都对应一个backing_device_info的结构,可以通过相应块设备的请求队列找到该结构。work_list存储了该设备的所有写回任务，每一个写回任务由wb_writeback_work定义，包括要写回多少页，写回哪些页，是否同步等等。bdi_writeback结构则定义了写回线程执行的函数，写回线程会在必要性被唤醒，然后执行写回逻辑。bdi_writeback主要有3个队列，其中每当有inode变脏，都会加入到b_dirty队列中，b_io则是所有需要写回的inode，wb_writeback_work所定义的写回任务就是针对b_io定义的inode。b_more_io则是保存所有需要再次写回的inode，这个队列的元素往往是因为在处理写回任务时，发现某些在b_io中的inode被锁住而不能马上写回，而临时转移到到b_more_io中。
+
+#### 定时写回
+
+　　写回线程会被定时唤醒，检查每一个inode的变脏时间，把符合要求的inode从b_dirty队列移到b_io队列。定时写回的任务一般不会从work_list里面取，而是尽可能多的写回每一个inode的所有脏页，直到没有脏页或者单个inode写回的时间过长。
+
+#### 内存空间不足
+
+　　当内存空间不足时，内核会尝试释放page cache，由于只有不为脏的页才能被释放，此时会先唤醒每一个bdi设备的写回线程，并且创建一个写1024页的任务插入work_list里。因此，所有脏的inode都会最多写1024页。
+
+#### 用户强制刷新脏页
+
+　　如果是sync单个文件，不会唤醒写回线程，也不会从work_list里面取任务，而是由写进程同步地去写回该文件的所有脏页；如果是sync整个文件系统，则唤醒所有设备的写回线程，并创建一个写所有脏页的任务插入每一个bdi的work_list，并等待写回任务完成。
+
+#### write调用写page时检查是否需要刷新
+
+　　每当用户写一个page到高速缓存层，则会检查该page所在inode是否为脏，如果首次变脏则把该inode加入superblock的s_dirty队列以及相应bdi结构的b_dirty队列。
+
+　　为了防止写入速度过快，使得高速缓存占用过高，每写一定数量的page（默认32页），则会检查当前是否需要写回。判断是否需要写回，受到两条水平线的限制，一条是background_thresh, 一条是dirty_thresh。这两条水平线一般会受整个操作系统所有脏页所占内存的影响。如果bdi设备配置了strictlimit，则主要受每一个bdi设备所设置的min ratio和max ratio所限制，此时由全局统计信息以及单个bdi设备的统计信息同时计算出是否超过这两条水平线。如果超过background_thresh，则唤醒写回线程执行写回任务。如果超过dirty_thresh，则当前写进程会阻塞，减缓写入速度。
+
+　　除了在写page时检查是否超出水平线，写回线程定时唤醒时也会检查是否超出background_thresh，如果超出则即便inode变脏时间没有超时，仍然要执行写回。
+
+　　如果写回线程被唤醒时work_list为空，则默认为每一个脏inode写回1024页。
+
+#### writepages
+
+　　具体的写回业务由具体操作系统的writepages方法执行。每一个写回任务都会转换成一次或多次writepages方法的调用。该方法与前面说到的readpages函数相似，都是构造bio，把请求提交给下层，直到设备驱动程序用DMA的方式写入磁盘。
+
+#### 写回inode本身
+
+　　不仅是脏页需要写回，inode携带的元信息也要被写回，基本上每执行一次writepages函数，写回一定数量的页，就会把inode也写回磁盘一次。由于inode一般存储在磁盘分区开始的地方，与数据的存储区域不连续，因此这里会造成随机写的情况。
+
+#### delay allocation
+
+　　传统的文件系统会选择则把page写到高速缓存层的时候，就为数据预先分配磁盘空间。由于这种策略使得磁盘空间分配与实际写回过程割裂，当多个文件并发写入磁盘时，容易造成严重的随机写现象。现代的文件系统，如xfs，ext4，都是在写回的时候才进行磁盘空间的分配，如此能极大地提升写性能。
+
+### <a name="chapter11"></a>open系统调用的关键参数解析
+
+　　前面讲的linux io其实主要是针对最常见的情况，也就是有缓存的同步阻塞io。有缓存指的是读写都要经过高速缓存层，vfs层实际上只负责与高速缓存（Page cache, buffer cache）打交道，而不直接与磁盘打交道。而同步阻塞io是5种io类型之一，具体的描述可参见之[Linux IO 模型](https://sizheluo.github.io/2023/04/Linux-IO%E6%A8%A1%E5%9E%8B/)。
+
+　　实际上，在open文件的时候我们可以加入一些特殊的参数，来改变io的方式。下面介绍几个关键参数。
+
+#### O_NONBLOCK
+
+　　该参数不能用于普通文件，加上该参数将以同步非阻塞方式读写文件。
+
+#### O_SYNC
+
+　　在写入高速缓存后不马上返回，而是要马上把高速缓存的数据以及文件元信息都写回到磁盘上，当磁盘写成功后返回。相当于每次写完之后调用一下fsync。
+
+　　这里的fsync跟fflush有区别，fflush是把用户态的buffer全部写到Kernel buffer，但不保证数据落盘；fsync则是保证用户态和内核态的buffer全部刷新到磁盘上。
+
+#### O_DSYNC
+
+　　在写入高速缓存后不马上返回，而是要马上把高速缓存的数据写回到磁盘上，当磁盘写成功后返回。相当于每次写完之后调用一下fdatasync。该参数与O_SYNC不同的是不保证文件元信息刷新到磁盘，但是，如果文件的元信息会影响之后的读取的话，则仍然会马上刷新到磁盘。例如最后修改时间，最后访问时间等不会刷到磁盘上，但文件大小发生改变的话则会发生文件元信息的刷新。
+
+#### O_DIRECT
+
+　　该参数会绕开高速缓存，而是直接由vfs层到通用块层，即直接构造用户态buffer到磁盘相应扇区的bio。这种方式避免了在用户态和内核态的多次内存拷贝，这个参数一般适用于用户程序已经构建了用户态的磁盘缓存，而不想再经过一层操作系统的缓存，希望直接管理数据对磁盘的读写。但这个参数有一个限制，就是用户态buffer的首地址以及大小都必须是块大小的整数倍，要进行块大小对齐。
+
+#### O_ASYNC
+
+　　信号驱动IO，而并非异步IO。这里提一下linux的异步IO。linux对异步IO支持不是很好，异步IO可以分为用户态异步IO和内核态异步IO。用户态异步IO由glibc提供的aio_read,aio_write函数完成，但评价不是很好，很多人都说有bug，而且性能较差。内核态异步IO性能较好，但限制较大，只有当文件是O_DIRECT打开的时候，才可以进行内核态的异步IO调用。
 
 ### 参考资源
 
 * [南国倾城](https://wjqwsp.github.io/2018/12/18/linux-io%E8%BF%87%E7%A8%8B%E8%87%AA%E9%A1%B6%E5%90%91%E4%B8%8B%E5%88%86%E6%9E%90/)
-
+* [Linux_Storage_Stack_Diagram](https://www.thomas-krenn.com/en/wiki/Linux_Storage_Stack_Diagram)
 * [Elvis Zhang](https://blog.shunzi.tech/post/Linux_Storage_Stack/)
+* [Gitbook: deep-into-linux-and-beyond](https://wxdublin.gitbooks.io/deep-into-linux-and-beyond/content/io.html)
 
 转载请注明：[sizheluo的博客](https://sizheluo.github.io) » [Linux下的五种IO模型](https://sizheluo.github.io/2023/04/Linux-IO%E6%A8%A1%E5%9E%8B//)
