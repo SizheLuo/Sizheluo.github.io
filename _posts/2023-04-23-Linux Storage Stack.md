@@ -54,28 +54,26 @@ IO是操作系统内核最重要的组成部分之一，它的概念很广，本
 ### <a name="chapter3"></a>从Hello world说起
 
 	#include "apue.h"
-	      
-	      #define BUFFSIZE        4096
+	#define BUFFSIZE 4096
 	       
-	      int
-	      main(void)
-	      {
-	              int             n;
-	              char    buf[BUFFSIZE];
-	              int fd1;
-	              int fd2;
-	             
-	              fd1 = open("helloworld.in", O_RONLY);
-	              fd2 = open("helloworld.out", O_WRONLY);
-	              while ((n = read(fd1, buf, BUFFSIZE)) > 0)
-	                     if (write(fd2, buf, n) != n)
-	                             err_sys("write error");
-	     
-	              if (n < 0)
-	                      err_sys("read error");
-	      
-	              exit(0);
-	     }
+	main(void)
+	{
+	      int n;
+	      char buf[BUFFSIZE];
+	      int fd1;
+	      int fd2;
+
+	      fd1 = open("helloworld.in", O_RONLY);
+	      fd2 = open("helloworld.out", O_WRONLY);
+	      while ((n = read(fd1, buf, BUFFSIZE)) > 0)
+	      	if (write(fd2, buf, n) != n)
+	        	err_sys("write error");
+
+	      if (n < 0)
+	      	err_sys("read error");
+	
+	      exit(0);
+	}
 
 　　看一个简单的hello world程序，它的功能非常简单，就是在栈空间里分配4096个字节作为buffer，从helloworld.in文件里读4KB到该buffer里，然后将该buffer的数据写到helloworld.out文件中。这个hello world进程是工作于用户态的，但由于操作系统的隔离性，用户态程序是无法直接操作硬件的，所以要通过`read`, `write`系统调用进入内核态，执行内核的相应代码。
 
